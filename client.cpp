@@ -14,11 +14,6 @@ ssize_t send_all(int fd, char *buf, int size) {
 	}
 	return i;
 }
-static inline uint64_t now_ns(void) {
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
-}
 int main(void) {
 	//i forgot what include statements i need on the top like #include <thing> or whatever
 	

@@ -11,4 +11,9 @@
 #define NUM_MESSAGES 1
 #define BUF_SIZE 65536
 #define INTERVAL_TIME 100
-static inline uint64_t now_ns(void);
+
+static inline uint64_t now_ns(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
