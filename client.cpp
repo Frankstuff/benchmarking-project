@@ -1,10 +1,4 @@
-
-#include <stdio.h>
-#include <string.h> //memset
-#include <netdb.h>//getaddrinfo
-#include <sys/socket.h>//socket
-#include <unistd.h>//close
-#include <arpa/inet.h> //what is this 
+#include "myheader.h"
 int main(void) {
 	//i forgot what include statements i need on the top like #include <thing> or whatever
 	//
@@ -48,6 +42,8 @@ int main(void) {
 	char ip4[INET_ADDRSTRLEN];
 	inet_ntop(AF_INET, &(thing.sin_addr), ip4, INET_ADDRSTRLEN);
 	printf("the ip adress is: %s\n", ip4);//i hope this works lowkey	
+	//now that we are connected, let's send out our stuff
+		
 	close(fd);
 	return 0;	
 }
