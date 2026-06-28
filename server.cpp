@@ -22,25 +22,46 @@ int main(void) {
 		//put them into the buffer and stuff
 		buf[i] = malloc(BUF_SIZE);	
 	}
-	char ack[1] = 'a';	
-	while (1) {
+	char ack[1] = {'a'};
+	while (true) {	
 		int acc = accept(my_socket, NULL, NULL);
 		if (acc < 0) {
 			continue;
-		}
-		ssize_t n;
-		size_t tot = 0;
-		//read below blocks till woken
-		//lowkey if we want to speedup the process of receiving the message shouldn't we 
-		while ((n = recv(acc, tot + buf[curr], BUF_SIZE - tot)) > 0) {//identical to read
-			tot += n;
-			//not sure what to do here probably copy them into the big buffer but that's counterproductive should just be placed there to begin with . . . 
-		}
-		send(acc, ack, 1, 0);
-		curr++;
-		close(acc);
-		if (curr == NUM_MESSAGES) {
-			break;
+		} else {
+			bool out = true;
+			while (curr < NUM_MESSAGES && out) {
+				ssize_t n;
+				size_t tot = 0;
+				//read below blocks till woken
+				//lowkey if we want to speedup the process of receiving the message shouldn't we 
+				while (tot < BUF_SIZE) {
+					n = recv(acc, tot + buf[curr], BUF_SIZE - tot);
+					if (n == 0) {
+						out = false;
+						break;
+					} else if (n < 0) {
+						if (errno == EINTR) {
+							continue;
+						} else {
+							out = false;
+							break;
+						}
+					}
+					tot += n;	
+				}
+				if (!out) {
+					break;
+				}
+				send(acc, ack, 1, 0);
+				curr++;
+				if (curr == NUM_MESSAGES) {
+					break;
+				}
+			}
+			close(acc);
+			if (curr == NUM_MESSAGES) {
+				break;
+			}
 		}	
 	}
 	for (int i = 0; i < NUM_MESSAGES; i++) {
