@@ -22,7 +22,7 @@ int main(void) {
 	hints.ai_socktype = SOCK_STREAM;//TCP   could be changed to UDP with DGRAM
 	struct addrinfo *res;
 	struct addrinfo *p;
-	int rv = getaddrinfo("localhost", "8080", &hints, &res);
+	int rv = getaddrinfo("192.168.252.2", "8080", &hints, &res);
 	if (0 == rv) {//forgot to fill in the function arguments
 		//we are gucci to proceed	
 	} else {
