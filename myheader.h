@@ -3,5 +3,9 @@
 #include <netdb.h>//getaddrinfo
 #include <sys/socket.h>//socket
 #include <unistd.h>//close
-#include <arpa/inet.h> //what is this 
-
+#include <arpa/inet.h> //what is th
+#include <cstdint>
+#include <time.h>
+#define NUM_MESSAGES 1
+#define BUF_SIZE 65536
+#define INTERVAL_TIME 100
