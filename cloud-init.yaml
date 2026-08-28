@@ -1,0 +1,27 @@
+#cloud-config
+
+package_update: true
+
+packages:
+  - git
+  - rdma-core
+  - ibverbs-utils
+  - libibverbs-dev
+
+runcmd:
+  # Load the Soft-RoCE kernel module
+  - modprobe rdma_rxe
+
+  # Find the network interface used for the default route.
+  # This avoids hardcoding enp0s1/eth0/etc.
+  - |
+      IFACE=$(ip route show default | awk '/default/ {print $5; exit}')
+      echo "Using network interface: $IFACE"
+
+      # Create the Soft-RoCE RDMA device.
+      rdma link add rxe0 type rxe netdev "$IFACE"
+
+  # Show what was created, useful for debugging first boot.
+  - rdma link
+  - ibv_devices
+  - ibv_devinfo
