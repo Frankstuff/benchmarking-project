@@ -52,7 +52,14 @@ struct ConnectionData {
     uint32_t packet_sequence_number;
     ibv_gid gid;
 };
+struct ConnectionDataWire {
+    uint32_t qp_number_network_order;
+    uint32_t packet_sequence_number_network_order;
+    uint8_t gid[16];
+};
+//let's just make sure the size is standard . . . obviously it should always be but if it isnt on a machine then we are cooked
 
+static_assert(sizeof(ConnectionDataWire) == 24, "Unexpected ConnectionDataWire size");
 //the functions below are just there to make sure that the data is sent even if send and receive fail (im pretty sure this is like 99% unnecessary because the messages i will be exchanging are extremely short
 
 bool send_all(int socket_fd, const void *data, std::size_t length)
@@ -258,6 +265,95 @@ int create_client_connection(const char *server_ip)
     return connected_socket;
 }
 
+bool exchange_connection_data(
+    int control_socket,
+    bool is_server,
+    const ConnectionData &local_data,
+    ConnectionData *remote_data
+)
+{
+    /*
+     * Convert our normal local representation into the exact
+     * representation that we will transmit over TCP.
+     */
+    ConnectionDataWire local_wire_data{};
+
+    local_wire_data.qp_number_network_order =
+        htonl(local_data.qp_number);
+
+    local_wire_data.packet_sequence_number_network_order =
+        htonl(local_data.packet_sequence_number);
+
+    std::memcpy(
+        local_wire_data.gid,
+        &local_data.gid,
+        sizeof(local_wire_data.gid)
+    );
+
+    /*
+     * This object will receive the bytes sent by the other VM.
+     */
+    ConnectionDataWire remote_wire_data{};
+
+    bool exchange_succeeded;
+
+    if (is_server) {
+        /*
+         * The server receives first and then responds.
+         */
+        exchange_succeeded =
+            receive_all(
+                control_socket,
+                &remote_wire_data,
+                sizeof(remote_wire_data)
+            ) &&
+            send_all(
+                control_socket,
+                &local_wire_data,
+                sizeof(local_wire_data)
+            );
+    }
+    else {
+        /*
+         * The client sends first and then waits for the response.
+         */
+        exchange_succeeded =
+            send_all(
+                control_socket,
+                &local_wire_data,
+                sizeof(local_wire_data)
+            ) &&
+            receive_all(
+                control_socket,
+                &remote_wire_data,
+                sizeof(remote_wire_data)
+            );
+    }
+
+    if (!exchange_succeeded) {
+        return false;
+    }
+
+    /*
+     * Convert the received wire representation into the
+     * representation used by the rest of our program.
+     */
+    remote_data->qp_number =
+        ntohl(remote_wire_data.qp_number_network_order);
+
+    remote_data->packet_sequence_number =
+        ntohl(
+            remote_wire_data.packet_sequence_number_network_order
+        );
+
+    std::memcpy(
+        &remote_data->gid,
+        remote_wire_data.gid,
+        sizeof(remote_wire_data.gid)
+    );
+
+    return true;
+}
 
 int main(int argc, char *argv[]) {
     int buffer_size = 1024;//I should make this a macro but whatever
@@ -359,11 +455,55 @@ int main(int argc, char *argv[]) {
 	return 1;
     }
 
+    uint32_t local_psn; //these are packet sequence numbers since we are using a RC (reliable connection) these help missing duplicate and OOO packets get detected
+
+    if (argc == 1) {
+        local_psn = 0x654321;
+    } else {
+        local_psn = 0x123456;
+    } 
+
+    ConnectionData local_connection_data{};
+
+    local_connection_data.qp_number = queue_pair->qp_num;
+    local_connection_data.packet_sequence_number = local_psn;
+    local_connection_data.gid = local_gid;
+
+    
+    std::printf(
+    "%s local connection information:\n"
+    "  QP number: %u\n"
+    "  PSN:       0x%06x\n"
+    "  GID:       %s\n", is_server ? "Server" : "Client", local_connection_data.qp_number, local_connection_data.packet_sequence_number, local_gid_string);
     //now the client and the server have established a tcp connection, but they need to exchange GIDs 
     //Global identifiers are used to recognize network ports on rdma adapters
 
+    ConnectionData remote_connection_data{};
+
+    bool exchange_succeeded = exchange_connection_data(control_socket, argc == 1, local_connection_data, &remote_connection_data);
+   
+     
+    if (!exchange_succeeded) {
+        std::fprintf(stderr, "Failed to exchange RDMA connection information\n");
+        return 1;
+    } 
+
+    char remote_gid_string[INET6_ADDRSTRLEN]{};
+
+    if (inet_ntop(AF_INET6, &remote_connection_data.gid, remote_gid_string, sizeof(remote_gid_string)) == nullptr) {
+        std::perror("inet_ntop for remote GID");
+        return 1;
+    }
+
+    //PRINT WHAT WE RECEIVED 
+    std::printf(
+    "%s received remote RDMA information:\n"
+    "  Remote QP number: %u\n"
+    "  Remote PSN:       0x%06x\n"
+    "  Remote GID:       %s\n",
+    is_server ? "Server" : "Client", remote_connection_data.qp_number, remote_connection_data.packet_sequence_number, remote_gid_string);
     
- 
+    
     close(control_socket);
     
     ibv_destroy_qp(queue_pair);
