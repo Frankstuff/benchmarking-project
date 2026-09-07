@@ -354,7 +354,97 @@ bool exchange_connection_data(
 
     return true;
 }
+int move_qp_to_rtr(
+    ibv_qp *queue_pair,
+    const ConnectionData &remote_connection_data,
+    ibv_mtu path_mtu
+)
+{
+    ibv_qp_attr attr{};
 
+    /*
+     * The state we want the QP to enter.
+     */
+    attr.qp_state = IBV_QPS_RTR;
+
+    /*
+     * Maximum RDMA packet size used on this path.
+     */
+    attr.path_mtu = path_mtu;
+
+    /*
+     * The QP number belonging to the other VM.
+     */
+    attr.dest_qp_num =
+        remote_connection_data.qp_number;
+
+    /*
+     * The first packet sequence number we expect to
+     * receive from the other VM.
+     */
+    attr.rq_psn =
+        remote_connection_data.packet_sequence_number;
+
+    /*
+     * Maximum number of incoming RDMA READ or atomic
+     * operations that can be handled simultaneously.
+     */
+    attr.max_dest_rd_atomic = 1;
+
+    /*
+     * How long the sender should wait when this QP
+     * reports Receiver Not Ready.
+     */
+    attr.min_rnr_timer = 12;
+
+    /*
+     * RXE/RoCE uses GID-based global routing.
+     */
+    attr.ah_attr.is_global = 1;
+
+    /*
+     * Destination GID: the remote VM's GID.
+     */
+    attr.ah_attr.grh.dgid =
+        remote_connection_data.gid;
+
+    /*
+     * Select our own local source GID.
+     */
+    attr.ah_attr.grh.sgid_index = GID_INDEX;
+
+    attr.ah_attr.grh.flow_label = 0;
+    attr.ah_attr.grh.hop_limit = 64;
+    attr.ah_attr.grh.traffic_class = 0;
+
+    /*
+     * LID is not used for your RXE/RoCE path.
+     */
+    attr.ah_attr.dlid = 0;
+
+    attr.ah_attr.sl = 0;
+    attr.ah_attr.src_path_bits = 0;
+
+    /*
+     * Send/receive through local RDMA device port 1.
+     */
+    attr.ah_attr.port_num = RDMA_PORT_NUMBER;
+
+    int attribute_mask =
+        IBV_QP_STATE |
+        IBV_QP_AV |
+        IBV_QP_PATH_MTU |
+        IBV_QP_DEST_QPN |
+        IBV_QP_RQ_PSN |
+        IBV_QP_MAX_DEST_RD_ATOMIC |
+        IBV_QP_MIN_RNR_TIMER;
+
+    return ibv_modify_qp(
+        queue_pair,
+        &attr,
+        attribute_mask
+    );
+}
 int main(int argc, char *argv[]) {
     int buffer_size = 1024;//I should make this a macro but whatever
     //I will be using a particular set of settings
@@ -503,7 +593,19 @@ int main(int argc, char *argv[]) {
     "  Remote GID:       %s\n",
     is_server ? "Server" : "Client", remote_connection_data.qp_number, remote_connection_data.packet_sequence_number, remote_gid_string);
     
-    
+    int rtr_result = move_qp_to_rtr(
+    queue_pair,
+    remote_connection_data,
+    port_attr.active_mtu
+);
+
+    if (rtr_result != 0) {
+        std::fprintf(stderr, "Could not move QP from INIT to RTR: %s\n", std::strerror(rtr_result));
+        return 1;
+    }
+
+    std::printf("%s successfully moved QP %u from INIT to RTR\n", is_server ? "Server" : "Client", queue_pair->qp_num);   
+ 
     close(control_socket);
     
     ibv_destroy_qp(queue_pair);
