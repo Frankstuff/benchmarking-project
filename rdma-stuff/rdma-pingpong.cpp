@@ -469,7 +469,7 @@ int main(int argc, char *argv[]) {
     local_connection_data.packet_sequence_number = local_psn;
     local_connection_data.gid = local_gid;
 
-    
+    int is_server = 1 == argc; 
     std::printf(
     "%s local connection information:\n"
     "  QP number: %u\n"
