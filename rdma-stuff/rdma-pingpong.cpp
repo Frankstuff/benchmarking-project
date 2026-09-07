@@ -38,6 +38,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 
@@ -51,15 +52,22 @@ struct ConnectionData {
     uint32_t qp_number;
     uint32_t packet_sequence_number;
     ibv_gid gid;
+
+    // The peer needs these two fields for one-sided RDMA READ/WRITE.
+    uint64_t exposed_buffer_address;
+    uint32_t exposed_buffer_rkey;
 };
 struct ConnectionDataWire {
     uint32_t qp_number_network_order;
     uint32_t packet_sequence_number_network_order;
     uint8_t gid[16];
+    uint8_t exposed_buffer_address_network_order[8];
+    uint32_t exposed_buffer_rkey_network_order;
 };
 //let's just make sure the size is standard . . . obviously it should always be but if it isnt on a machine then we are cooked
 
-static_assert(sizeof(ConnectionDataWire) == 24, "Unexpected ConnectionDataWire size");
+
+static_assert(sizeof(ConnectionDataWire) == 36, "Unexpected ConnectionDataWire size");
 //the functions below are just there to make sure that the data is sent even if send and receive fail (im pretty sure this is like 99% unnecessary because the messages i will be exchanging are extremely short
 
 bool send_all(int socket_fd, const void *data, std::size_t length)
@@ -265,6 +273,26 @@ int create_client_connection(const char *server_ip)
     return connected_socket;
 }
 
+void encode_uint64_network_order(uint64_t value, uint8_t output[8])
+{
+    // Store the most significant byte first, which is network byte order.
+    for (int index = 0; index < 8; ++index) {
+        output[7 - index] = static_cast<uint8_t>(value & 0xffU);
+        value >>= 8;
+    }
+}
+
+uint64_t decode_uint64_network_order(const uint8_t input[8])
+{
+    uint64_t value = 0;
+
+    for (int index = 0; index < 8; ++index) {
+        value = (value << 8) | input[index];
+    }
+
+    return value;
+}
+
 bool exchange_connection_data(
     int control_socket,
     bool is_server,
@@ -289,6 +317,14 @@ bool exchange_connection_data(
         &local_data.gid,
         sizeof(local_wire_data.gid)
     );
+
+    encode_uint64_network_order(
+        local_data.exposed_buffer_address,
+        local_wire_data.exposed_buffer_address_network_order
+    );
+
+    local_wire_data.exposed_buffer_rkey_network_order =
+        htonl(local_data.exposed_buffer_rkey);
 
     /*
      * This object will receive the bytes sent by the other VM.
@@ -351,6 +387,14 @@ bool exchange_connection_data(
         remote_wire_data.gid,
         sizeof(remote_wire_data.gid)
     );
+
+    remote_data->exposed_buffer_address =
+        decode_uint64_network_order(
+            remote_wire_data.exposed_buffer_address_network_order
+        );
+
+    remote_data->exposed_buffer_rkey =
+        ntohl(remote_wire_data.exposed_buffer_rkey_network_order);
 
     return true;
 }
@@ -445,6 +489,214 @@ int move_qp_to_rtr(
         attribute_mask
     );
 }
+
+int move_qp_to_rts(
+    ibv_qp *queue_pair,
+    uint32_t local_psn
+)
+{
+    ibv_qp_attr attr{};
+
+    /*
+     * Move the Queue Pair into Ready-to-Send state.
+     */
+    attr.qp_state = IBV_QPS_RTS;
+
+    /*
+     * Timeout while waiting for an acknowledgement
+     * from the remote RC Queue Pair.
+     */
+    attr.timeout = 14;
+
+    /*
+     * Number of retries for failures such as a missing
+     * acknowledgement.
+     */
+    attr.retry_cnt = 7;
+
+    /*
+     * Number of retries when the receiver reports
+     * Receiver Not Ready.
+     *
+     * For this field, 7 means retry indefinitely.
+     */
+    attr.rnr_retry = 7;
+
+    /*
+     * The first packet sequence number this local QP
+     * will use when sending.
+     */
+    attr.sq_psn = local_psn;
+
+    /*
+     * Maximum number of outstanding RDMA READ or
+     * atomic operations initiated by this QP.
+     */
+    attr.max_rd_atomic = 1;
+
+    int attribute_mask =
+        IBV_QP_STATE |
+        IBV_QP_TIMEOUT |
+        IBV_QP_RETRY_CNT |
+        IBV_QP_RNR_RETRY |
+        IBV_QP_SQ_PSN |
+        IBV_QP_MAX_QP_RD_ATOMIC;
+
+    return ibv_modify_qp(
+        queue_pair,
+        &attr,
+        attribute_mask
+    );
+}
+
+constexpr uint64_t RECEIVE_WORK_REQUEST_ID = 1;
+constexpr uint64_t SEND_WORK_REQUEST_ID = 2;
+constexpr uint64_t RDMA_READ_WORK_REQUEST_ID = 3;
+
+int post_receive_message(
+    ibv_qp *queue_pair,
+    ibv_mr *memory_region,
+    char *buffer,
+    uint32_t buffer_size
+)
+{
+    // The scatter/gather entry describes the registered local memory into
+    // which the RDMA device may place the next incoming SEND message.
+    ibv_sge scatter_gather_entry{};
+    scatter_gather_entry.addr = reinterpret_cast<uintptr_t>(buffer);
+    scatter_gather_entry.length = buffer_size;
+    scatter_gather_entry.lkey = memory_region->lkey;
+
+    ibv_recv_wr receive_work_request{};
+    receive_work_request.wr_id = RECEIVE_WORK_REQUEST_ID;
+    receive_work_request.sg_list = &scatter_gather_entry;
+    receive_work_request.num_sge = 1;
+
+    ibv_recv_wr *bad_work_request = nullptr;
+
+    return ibv_post_recv(
+        queue_pair,
+        &receive_work_request,
+        &bad_work_request
+    );
+}
+
+int post_send_message(
+    ibv_qp *queue_pair,
+    ibv_mr *memory_region,
+    char *buffer,
+    uint32_t message_length
+)
+{
+    // This SGE describes the registered local bytes that the device should
+    // read and transmit to the peer's already-posted receive buffer.
+    ibv_sge scatter_gather_entry{};
+    scatter_gather_entry.addr = reinterpret_cast<uintptr_t>(buffer);
+    scatter_gather_entry.length = message_length;
+    scatter_gather_entry.lkey = memory_region->lkey;
+
+    ibv_send_wr send_work_request{};
+    send_work_request.wr_id = SEND_WORK_REQUEST_ID;
+    send_work_request.sg_list = &scatter_gather_entry;
+    send_work_request.num_sge = 1;
+    send_work_request.opcode = IBV_WR_SEND;
+
+    // sq_sig_all was left as zero when the QP was created, so this flag asks
+    // for a completion entry for this particular SEND.
+    send_work_request.send_flags = IBV_SEND_SIGNALED;
+
+    ibv_send_wr *bad_work_request = nullptr;
+
+    return ibv_post_send(
+        queue_pair,
+        &send_work_request,
+        &bad_work_request
+    );
+}
+
+int post_rdma_read(
+    ibv_qp *queue_pair,
+    ibv_mr *local_memory_region,
+    char *local_destination_buffer,
+    uint32_t bytes_to_read,
+    uint64_t remote_source_address,
+    uint32_t remote_rkey
+)
+{
+    // For RDMA READ, the local SGE is the destination: this is where the
+    // bytes pulled from the remote machine will be written locally.
+    ibv_sge local_destination{};
+    local_destination.addr =
+        reinterpret_cast<uintptr_t>(local_destination_buffer);
+    local_destination.length = bytes_to_read;
+    local_destination.lkey = local_memory_region->lkey;
+
+    ibv_send_wr read_work_request{};
+    read_work_request.wr_id = RDMA_READ_WORK_REQUEST_ID;
+    read_work_request.sg_list = &local_destination;
+    read_work_request.num_sge = 1;
+    read_work_request.opcode = IBV_WR_RDMA_READ;
+    read_work_request.send_flags = IBV_SEND_SIGNALED;
+
+    // Unlike two-sided SEND, RDMA READ names the exact remote virtual
+    // address and presents the rkey that authorizes access to that MR.
+    read_work_request.wr.rdma.remote_addr = remote_source_address;
+    read_work_request.wr.rdma.rkey = remote_rkey;
+
+    ibv_send_wr *bad_work_request = nullptr;
+
+    return ibv_post_send(
+        queue_pair,
+        &read_work_request,
+        &bad_work_request
+    );
+}
+
+bool wait_for_completion(
+    ibv_cq *completion_queue,
+    uint64_t expected_work_request_id
+)
+{
+    while (true) {
+        ibv_wc completion{};
+
+        int number_of_completions = ibv_poll_cq(
+            completion_queue,
+            1,
+            &completion
+        );
+
+        if (number_of_completions < 0) {
+            std::fprintf(stderr, "ibv_poll_cq failed\n");
+            return false;
+        }
+
+        if (number_of_completions == 0) {
+            continue;
+        }
+
+        if (completion.status != IBV_WC_SUCCESS) {
+            std::fprintf(
+                stderr,
+                "RDMA operation failed: %s\n",
+                ibv_wc_status_str(completion.status)
+            );
+            return false;
+        }
+
+        if (completion.wr_id != expected_work_request_id) {
+            std::fprintf(
+                stderr,
+                "Unexpected work request ID: %llu\n",
+                static_cast<unsigned long long>(completion.wr_id)
+            );
+            return false;
+        }
+
+        return true;
+    }
+}
+
 int main(int argc, char *argv[]) {
     int buffer_size = 1024;//I should make this a macro but whatever
     //I will be using a particular set of settings
@@ -490,9 +742,19 @@ int main(int argc, char *argv[]) {
 
     struct ibv_pd *pd = ibv_alloc_pd(pointer_to_device_context); 
    
-    char *buffer = (char *)malloc(buffer_size);
+    // Three non-overlapping areas inside one registered Memory Region:
+    //   1. buffer: the earlier two-sided SEND/RECV demonstration
+    //   2. exposed_secret_buffer: bytes the peer may pull with RDMA READ
+    //   3. read_result_buffer: local destination for the pulled bytes
+    char *buffer = static_cast<char *>(malloc(3 * buffer_size));
+    if (buffer == nullptr) {
+        std::perror("malloc");
+        return 1;
+    }
+    char *exposed_secret_buffer = buffer + buffer_size;
+    char *read_result_buffer = buffer + (2 * buffer_size);
     //forgot i'm writing c++ so actually I don't need to write struct like i do in C (unless i have a typedef)
-    ibv_mr *memory_region = ibv_reg_mr(pd, buffer, buffer_size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+    ibv_mr *memory_region = ibv_reg_mr(pd, buffer, 3 * buffer_size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
   
     //the queue below has 16 entries 
     ibv_cq *completion_queue = ibv_create_cq(pointer_to_device_context, 16, nullptr, nullptr, 0); //once completion queue for sending and receiving
@@ -545,6 +807,8 @@ int main(int argc, char *argv[]) {
 	return 1;
     }
 
+    bool is_server = (argc == 1);
+
     uint32_t local_psn; //these are packet sequence numbers since we are using a RC (reliable connection) these help missing duplicate and OOO packets get detected
 
     if (argc == 1) {
@@ -555,16 +819,36 @@ int main(int argc, char *argv[]) {
 
     ConnectionData local_connection_data{};
 
+    // This buffer remains unchanged during the earlier SEND/RECV test. It is
+    // the memory that the peer will later pull using a one-sided RDMA READ.
+    std::snprintf(
+        exposed_secret_buffer,
+        buffer_size,
+        "%s",
+        is_server ? "I love you" : "I hate you"
+    );
+    std::memset(read_result_buffer, 0, buffer_size);
+
     local_connection_data.qp_number = queue_pair->qp_num;
     local_connection_data.packet_sequence_number = local_psn;
     local_connection_data.gid = local_gid;
+    local_connection_data.exposed_buffer_address =
+        reinterpret_cast<uint64_t>(exposed_secret_buffer);
+    local_connection_data.exposed_buffer_rkey = memory_region->rkey;
 
-    int is_server = 1 == argc; 
     std::printf(
     "%s local connection information:\n"
     "  QP number: %u\n"
     "  PSN:       0x%06x\n"
-    "  GID:       %s\n", is_server ? "Server" : "Client", local_connection_data.qp_number, local_connection_data.packet_sequence_number, local_gid_string);
+    "  GID:       %s\n"
+    "  Exposed address: 0x%llx\n"
+    "  Exposed rkey:    0x%x\n",
+    is_server ? "Server" : "Client",
+    local_connection_data.qp_number,
+    local_connection_data.packet_sequence_number,
+    local_gid_string,
+    static_cast<unsigned long long>(local_connection_data.exposed_buffer_address),
+    local_connection_data.exposed_buffer_rkey);
     //now the client and the server have established a tcp connection, but they need to exchange GIDs 
     //Global identifiers are used to recognize network ports on rdma adapters
 
@@ -590,8 +874,15 @@ int main(int argc, char *argv[]) {
     "%s received remote RDMA information:\n"
     "  Remote QP number: %u\n"
     "  Remote PSN:       0x%06x\n"
-    "  Remote GID:       %s\n",
-    is_server ? "Server" : "Client", remote_connection_data.qp_number, remote_connection_data.packet_sequence_number, remote_gid_string);
+    "  Remote GID:       %s\n"
+    "  Remote address:   0x%llx\n"
+    "  Remote rkey:      0x%x\n",
+    is_server ? "Server" : "Client",
+    remote_connection_data.qp_number,
+    remote_connection_data.packet_sequence_number,
+    remote_gid_string,
+    static_cast<unsigned long long>(remote_connection_data.exposed_buffer_address),
+    remote_connection_data.exposed_buffer_rkey);
     
     int rtr_result = move_qp_to_rtr(
     queue_pair,
@@ -605,7 +896,210 @@ int main(int argc, char *argv[]) {
     }
 
     std::printf("%s successfully moved QP %u from INIT to RTR\n", is_server ? "Server" : "Client", queue_pair->qp_num);   
- 
+
+    int rts_result = move_qp_to_rts(queue_pair, local_psn);
+
+    if (rts_result != 0) {
+        std::fprintf(stderr, "Could not move QP from RTR to RTS: %s\n", std::strerror(rts_result));
+        return 1;
+    }
+
+    std::printf("%s successfully moved QP %u from RTR to RTS\n", is_server ? "Server" : "Client", queue_pair->qp_num);
+
+    /*
+     * FIRST REAL RDMA TRANSFER
+     *
+     * The server posts a receive before telling the client that it is ready.
+     * The client then posts one signaled SEND containing "I hate you".
+     */
+    constexpr uint8_t SERVER_RECEIVE_IS_READY = 1;
+    constexpr uint8_t SERVER_FINISHED_RECEIVING = 2;
+
+    if (is_server) {
+        int post_receive_result = post_receive_message(
+            queue_pair,
+            memory_region,
+            buffer,
+            static_cast<uint32_t>(buffer_size)
+        );
+
+        if (post_receive_result != 0) {
+            std::fprintf(
+                stderr,
+                "Could not post receive Work Request: %s\n",
+                std::strerror(post_receive_result)
+            );
+            return 1;
+        }
+
+        // This byte travels over TCP. It prevents the client from sending
+        // before the server has supplied a receive buffer to its RQ.
+        uint8_t ready_message = SERVER_RECEIVE_IS_READY;
+        if (!send_all(control_socket, &ready_message, sizeof(ready_message))) {
+            std::fprintf(stderr, "Could not send ready message over TCP\n");
+            return 1;
+        }
+
+        std::printf("Server posted a receive and is waiting for RDMA data...\n");
+
+        if (!wait_for_completion(
+                completion_queue,
+                RECEIVE_WORK_REQUEST_ID
+            )) {
+            return 1;
+        }
+
+        // The receive completion proves that the incoming SEND has finished
+        // writing into `buffer`, so the CPU may now safely read it.
+        std::printf("Server received through RDMA: %s\n", buffer);
+
+        uint8_t finished_message = SERVER_FINISHED_RECEIVING;
+        if (!send_all(
+                control_socket,
+                &finished_message,
+                sizeof(finished_message)
+            )) {
+            std::fprintf(stderr, "Could not send completion message over TCP\n");
+            return 1;
+        }
+    }
+    else {
+        std::snprintf(buffer, buffer_size, "I hate you");
+
+        // Wait until the server confirms, over TCP, that its receive WR is
+        // already on the Receive Queue.
+        uint8_t ready_message = 0;
+        if (!receive_all(
+                control_socket,
+                &ready_message,
+                sizeof(ready_message)
+            ) || ready_message != SERVER_RECEIVE_IS_READY) {
+            std::fprintf(stderr, "Did not receive the server-ready message\n");
+            return 1;
+        }
+
+        uint32_t message_length =
+            static_cast<uint32_t>(std::strlen(buffer) + 1);
+
+        int post_send_result = post_send_message(
+            queue_pair,
+            memory_region,
+            buffer,
+            message_length
+        );
+
+        if (post_send_result != 0) {
+            std::fprintf(
+                stderr,
+                "Could not post SEND Work Request: %s\n",
+                std::strerror(post_send_result)
+            );
+            return 1;
+        }
+
+        std::printf("Client posted RDMA SEND: %s\n", buffer);
+
+        if (!wait_for_completion(
+                completion_queue,
+                SEND_WORK_REQUEST_ID
+            )) {
+            return 1;
+        }
+
+        std::printf("Client SEND completed successfully\n");
+
+        // Keep both programs alive until the server has consumed the receive
+        // completion and printed the received bytes.
+        uint8_t finished_message = 0;
+        if (!receive_all(
+                control_socket,
+                &finished_message,
+                sizeof(finished_message)
+            ) || finished_message != SERVER_FINISHED_RECEIVING) {
+            std::fprintf(stderr, "Server did not confirm the receive\n");
+            return 1;
+        }
+    }
+
+    /*
+     * ONE-SIDED RDMA READ IN BOTH DIRECTIONS
+     *
+     * No receive Work Request is posted for this operation. Each local QP
+     * reaches directly into the peer's registered exposed_secret_buffer by
+     * supplying its address and rkey. The pulled bytes land in the local
+     * read_result_buffer.
+     */
+    int post_read_result = post_rdma_read(
+        queue_pair,
+        memory_region,
+        read_result_buffer,
+        static_cast<uint32_t>(buffer_size),
+        remote_connection_data.exposed_buffer_address,
+        remote_connection_data.exposed_buffer_rkey
+    );
+
+    if (post_read_result != 0) {
+        std::fprintf(
+            stderr,
+            "Could not post RDMA READ Work Request: %s\n",
+            std::strerror(post_read_result)
+        );
+        return 1;
+    }
+
+    if (!wait_for_completion(
+            completion_queue,
+            RDMA_READ_WORK_REQUEST_ID
+        )) {
+        return 1;
+    }
+
+    std::printf(
+        "%s grabbed through one-sided RDMA READ: %s\n",
+        is_server ? "Server" : "Client",
+        read_result_buffer
+    );
+
+    // Both peers must finish reading before either deregisters its MR. This
+    // final TCP barrier protects the lifetime of both exposed buffers/rkeys.
+    constexpr uint8_t RDMA_READ_FINISHED = 3;
+    uint8_t local_read_finished = RDMA_READ_FINISHED;
+    uint8_t remote_read_finished = 0;
+
+    bool final_barrier_succeeded;
+    if (is_server) {
+        final_barrier_succeeded =
+            receive_all(
+                control_socket,
+                &remote_read_finished,
+                sizeof(remote_read_finished)
+            ) &&
+            send_all(
+                control_socket,
+                &local_read_finished,
+                sizeof(local_read_finished)
+            );
+    }
+    else {
+        final_barrier_succeeded =
+            send_all(
+                control_socket,
+                &local_read_finished,
+                sizeof(local_read_finished)
+            ) &&
+            receive_all(
+                control_socket,
+                &remote_read_finished,
+                sizeof(remote_read_finished)
+            );
+    }
+
+    if (!final_barrier_succeeded ||
+        remote_read_finished != RDMA_READ_FINISHED) {
+        std::fprintf(stderr, "Final RDMA READ barrier failed\n");
+        return 1;
+    }
+
     close(control_socket);
     
     ibv_destroy_qp(queue_pair);
